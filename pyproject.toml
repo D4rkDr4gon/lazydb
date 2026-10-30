@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lazydb"
+version = "0.1.0"
+description = "A terminal database client: profiles, object tree, SQL editor, editable results, Excel and CSV export."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "D4rkDr4gon" }]
+requires-python = ">=3.10"
+dependencies = ["textual>=1.0"]
+keywords = ["database", "sql", "tui", "textual", "postgresql", "mysql", "mariadb", "sqlite", "sql-server"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database :: Front-Ends",
+]
+
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.1"]
+mysql = ["pymysql>=1.0"]
+mssql = ["pymssql>=2.2.8"]
+syntax = ["textual[syntax]"]
+all = ["psycopg[binary]>=3.1", "pymysql>=1.0", "pymssql>=2.2.8", "textual[syntax]"]
+
+[project.urls]
+Homepage = "https://github.com/D4rkDr4gon/lazydb"
+Issues = "https://github.com/D4rkDr4gon/lazydb/issues"
+
+[project.scripts]
+lazydb = "lazydb.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lazydb"]

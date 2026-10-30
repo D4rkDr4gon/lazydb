@@ -1,0 +1,615 @@
+"""
+ui.py — piezas de interfaz de lazydb (Textual), estilo impala/bluetui.
+
+Sale de dtui.py, la base común de las TUIs de D4rkFiles:
+- DView / ViewApp: el contenido de la TUI y la app que lo monta.
+- Panel: borde redondeado con título; el que tiene foco va en el color primario.
+- Table: DataTable con selección de fila completa (`set_rows` refresca sin parpadeo).
+- KeyHints: línea de atajos al pie.
+- FormModal / ConfirmModal / PickModal / TextModal: popups centrados.
+
+Colores: un theme.json con las claves de THEME_KEYS, de LAZYDB_THEME o
+~/.config/lazydb/theme.json; si no hay, el tema por defecto (rojo sobre negro).
+Teclas: ~/.config/lazydb/keymap.json ({"LazyDbView.run_statement": "ctrl+e"}).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Callable, Optional
+
+from rich.text import Text
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Vertical, VerticalScroll
+from textual.screen import ModalScreen
+from textual.suggester import Suggester
+from textual.widget import Widget
+from textual.widgets import DataTable, Input, Label, Select, Static
+
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "lazydb"
+THEME_FILE = Path(os.environ.get("LAZYDB_THEME", CONFIG_DIR / "theme.json")).expanduser()
+# Teclas reasignadas: {id del binding: "teclas"}. Solo lo que cambia; el resto usa BINDINGS.
+KEYMAP_FILE = Path(os.environ.get("LAZYDB_KEYMAP", CONFIG_DIR / "keymap.json")).expanduser()
+
+# ── Tema ──────────────────────────────────────────────────
+
+def hex_blend(c1: str, c2: str, pct: int) -> str:
+    """Mezcla dos colores #rrggbb: pct % del primero."""
+    c1, c2 = c1.lstrip("#"), c2.lstrip("#")
+    a = [int(c1[i:i + 2], 16) for i in (0, 2, 4)]
+    b = [int(c2[i:i + 2], 16) for i in (0, 2, 4)]
+    return "#" + "".join(f"{(x * pct + y * (100 - pct)) // 100:02x}" for x, y in zip(a, b))
+
+
+THEME_KEYS = ("primary", "secondary", "background", "foreground", "chip_battery", "chip_bluetooth",
+              "chip_wlan", "chip_audio", "status_ok", "status_warn", "status_error")
+
+
+def load_theme(path: Path = THEME_FILE) -> dict:
+    t = {
+        "primary": "#c62828", "secondary": "#8e1a1a",
+        "background": "#0f0f10", "foreground": "#c5c8c6",
+        "chip_battery": "#1a1515", "chip_bluetooth": "#2a1a1a",
+        "chip_wlan": "#3a2020", "chip_audio": "#4a2525",
+        "status_ok": "#5cb85c", "status_warn": "#f9a825", "status_error": "#ff1744",
+    }
+    try:
+        data = json.loads(path.read_text())
+        t.update({k: v for k, v in data.items() if k in t})
+    except (OSError, json.JSONDecodeError):
+        pass
+    t["muted"] = hex_blend(t["foreground"], t["background"], 45)
+    # Borde de panel sin foco: visible pero sin competir con el primario
+    t["border"] = hex_blend(t["foreground"], t["background"], 22)
+    return t
+
+
+THEME = load_theme()
+
+
+def css(template: str) -> str:
+    """Rellena %(clave)s con los colores del tema (escapar % como %%)."""
+    return template % THEME
+
+
+BASE_CSS = css("""
+Screen { background: %(background)s; color: %(foreground)s; }
+
+/* Panel: borde redondeado, título sobre el borde */
+.panel {
+    border: round %(border)s;
+    border-title-color: %(muted)s;
+    border-title-style: bold;
+    border-subtitle-color: %(muted)s;
+    background: %(background)s;
+    padding: 0 1;
+}
+.panel:focus-within {
+    border: round %(primary)s;
+    border-title-color: %(primary)s;
+}
+
+DataTable { background: %(background)s; color: %(foreground)s; scrollbar-size-vertical: 1; overflow-x: hidden; }
+DataTable > .datatable--header { background: %(background)s; color: %(muted)s; text-style: bold; }
+/* Fila seleccionada: tenue en paneles sin foco, marcada en el que tiene foco.
+   Los colores de cada celda se conservan (Table usa cursor_foreground_priority
+   "renderable"), así barras y estados no se pierden en la fila seleccionada. */
+DataTable > .datatable--cursor { background: %(chip_battery)s; color: %(foreground)s; text-style: none; }
+DataTable:focus > .datatable--cursor { background: %(chip_audio)s; color: %(foreground)s; text-style: bold; }
+DataTable > .datatable--hover { background: %(chip_battery)s; }
+
+KeyHints { dock: bottom; height: 1; padding: 0 2; background: %(background)s; color: %(muted)s; }
+
+Input {
+    background: %(chip_battery)s; color: %(foreground)s;
+    border: none; padding: 0 1; height: 1;
+}
+Input:focus { background: %(chip_wlan)s; }
+Input > .input--cursor { background: %(primary)s; color: %(background)s; }
+Input > .input--suggestion { color: %(muted)s; }
+Input > .input--placeholder { color: %(muted)s; }
+
+Select { height: auto; }
+Select > SelectCurrent {
+    background: %(chip_battery)s; color: %(foreground)s;
+    border: none; padding: 0 1; height: 1;
+}
+Select:focus > SelectCurrent { background: %(chip_wlan)s; border: none; }
+Select > SelectOverlay {
+    background: %(chip_battery)s; color: %(foreground)s;
+    border: round %(primary)s;
+}
+Select > SelectOverlay > .option-list--option-highlighted { background: %(chip_audio)s; text-style: bold; }
+
+/* Editor de texto (SQL): mismo fondo, cursor y selección en los colores del tema */
+TextArea { background: %(background)s; color: %(foreground)s; border: none; padding: 0; scrollbar-size: 1 1; }
+TextArea:focus { border: none; }
+TextArea > .text-area--cursor { background: %(primary)s; color: %(background)s; }
+TextArea > .text-area--cursor-line { background: %(chip_battery)s; }
+TextArea > .text-area--selection { background: %(chip_audio)s; }
+TextArea > .text-area--gutter { color: %(border)s; }
+TextArea > .text-area--cursor-gutter { color: %(muted)s; }
+TextArea > .text-area--placeholder { color: %(muted)s; }
+
+DView { height: 1fr; }
+
+/* Popups */
+ModalScreen { align: center middle; background: %(background)s 60%%; }
+.modal {
+    width: 76; height: auto; max-height: 90%%; overflow-y: auto;
+    border: round %(primary)s;
+    border-title-color: %(primary)s; border-title-style: bold;
+    border-subtitle-color: %(muted)s;
+    background: %(background)s; padding: 1 2;
+    scrollbar-size-vertical: 1;
+    scrollbar-color: %(border)s; scrollbar-color-hover: %(primary)s; scrollbar-color-active: %(primary)s;
+    scrollbar-background: %(background)s; scrollbar-background-hover: %(background)s;
+    scrollbar-background-active: %(background)s;
+}
+.modal .field-label { color: %(muted)s; margin-top: 1; }
+.modal .field-label.first { margin-top: 0; }
+.modal .hint { color: %(muted)s; margin-top: 1; }
+.modal .error { color: %(status_error)s; margin-top: 1; height: auto; }
+.modal .message { margin-bottom: 1; }
+
+PickModal .modal { width: 90%%; }
+PickModal DataTable { height: auto; max-height: 20; }
+TextModal .modal { width: 90%%; height: 90%%; }
+TextModal VerticalScroll { background: %(background)s; scrollbar-size-vertical: 1; }
+""")
+
+
+# ── Piezas ────────────────────────────────────────────────
+
+class KeyHints(Static):
+    """Línea de atajos al pie: [("enter", "upload"), ("q", "quit")]."""
+
+    def __init__(self, hints: list[tuple[str, str]] | None = None, **kw) -> None:
+        super().__init__("", **kw)
+        self.set_hints(hints or [])
+
+    def set_hints(self, hints: list[tuple[str, str]]) -> None:
+        t = Text()
+        for i, (key, label) in enumerate(hints):
+            if i:
+                t.append("   ")
+            t.append(key, style=f"bold {THEME['primary']}")
+            t.append(f" {label}", style=THEME["muted"])
+        self.update(t)
+
+
+class Table(DataTable):
+    """DataTable con los defaults de estas TUIs: selección de fila completa,
+    la fila seleccionada conserva los colores propios de cada celda y j/k
+    se mueven igual que las flechas (saltando encabezados de grupo)."""
+
+    BINDINGS = [Binding("j", "cursor_down", show=False), Binding("k", "cursor_up", show=False)]
+
+    def __init__(self, **kw) -> None:
+        kw.setdefault("cursor_type", "row")
+        kw.setdefault("cursor_foreground_priority", "renderable")
+        super().__init__(**kw)
+
+    def selected_key(self) -> Optional[str]:
+        """Clave de la fila seleccionada (None si la tabla está vacía)."""
+        if not self.row_count or self.cursor_row is None:
+            return None
+        return self.coordinate_to_cell_key(self.cursor_coordinate).row_key.value
+
+    # Filas de encabezado de grupo: su clave empieza con "hdr:" o "gap:" y el
+    # cursor las saltea al moverse con flechas / j / k.
+    SKIP = ("hdr:", "gap:")
+
+    def _skippable(self, row: int) -> bool:
+        try:
+            return str(self.ordered_rows[row].key.value).startswith(self.SKIP)
+        except IndexError:
+            return False
+
+    def _step(self, d: int) -> None:
+        nxt = (self.cursor_row or 0) + d
+        while 0 <= nxt < self.row_count and self._skippable(nxt):
+            nxt += d
+        if 0 <= nxt < self.row_count:
+            self.move_cursor(row=nxt)
+
+    def action_cursor_down(self) -> None:
+        self._step(1)
+
+    def action_cursor_up(self) -> None:
+        self._step(-1)
+
+    def first_selectable(self, start: int = 0) -> None:
+        """Lleva el cursor a la primera fila seleccionable desde `start`."""
+        row = max(0, min(start, self.row_count - 1))
+        while row < self.row_count and self._skippable(row):
+            row += 1
+        if row < self.row_count:
+            self.move_cursor(row=row)
+
+    def set_rows(self, rows: list[tuple[str, list]]) -> bool:
+        """Reemplaza las filas [(clave, [celdas])] solo si cambiaron, así un
+        refresco periódico no parpadea ni pierde la selección (que se busca
+        por clave). Devuelve True si redibujó."""
+        sig = repr(rows)
+        if sig == getattr(self, "_rows_sig", None):
+            return False
+        self._rows_sig = sig
+        key, row = self.selected_key(), self.cursor_row or 0
+        self.clear()
+        for k, cells in rows:
+            self.add_row(*cells, key=k)
+        keys = [k for k, _ in rows]
+        if self.row_count:
+            self.move_cursor(row=keys.index(key) if key in keys else min(row, self.row_count - 1))
+            if self._skippable(self.cursor_row):
+                self.first_selectable(self.cursor_row)
+        return True
+
+
+def Panel(*children, title: str = "", subtitle: str = "", id: str | None = None,
+          classes: str = "") -> Vertical:
+    """Bloque con borde redondeado y título (estilo ratatui Block)."""
+    v = Vertical(*children, id=id, classes=f"panel {classes}".strip())
+    v.border_title = f" {title} " if title else ""
+    v.border_subtitle = subtitle
+    return v
+
+
+class PathSuggester(Suggester):
+    """Autocompleta rutas locales (→ o fin acepta la sugerencia). Por
+    defecto solo carpetas; con files=True también archivos."""
+
+    def __init__(self, files: bool = False) -> None:
+        super().__init__(use_cache=False, case_sensitive=True)
+        self.files = files
+
+    async def get_suggestion(self, value: str) -> Optional[str]:
+        if not value:
+            return None
+        path = Path(value).expanduser()
+        parent, stem = (path, "") if value.endswith("/") else (path.parent, path.name)
+        try:
+            for child in sorted(parent.iterdir()):
+                if not (child.is_dir() or self.files) or not child.name.startswith(stem):
+                    continue
+                if not stem and child.name.startswith("."):
+                    continue
+                rest = child.name[len(stem):] + ("/" if child.is_dir() else "")
+                return value + rest if rest else None
+        except OSError:
+            return None
+        return None
+
+
+# ── Teclas configurables ──────────────────────────────────
+# Cada Binding de una DView / DApp recibe un id "Clase.acción" (ej.
+# "LazyDbView.filter", "DApp.quit"), así Textual puede reasignarlo con
+# un keymap (App.set_keymap) sin tocar el código de cada vista. Los atajos del
+# pie (hints) se traducen solos a la tecla nueva.
+
+KEY_DISPLAY = {"slash": "/", "minus": "-", "plus": "+", "equals_sign": "=", "question_mark": "?",
+               "left": "←", "right": "→", "up": "↑", "down": "↓", "escape": "esc", "enter": "enter",
+               "space": "space", "comma": ",", "full_stop": ".", "backspace": "bksp", "delete": "del"}
+
+
+def key_display(keys: str) -> str:
+    """Primera tecla de "a,b" como se muestra en el pie: slash → /, ctrl+s → ctrl+s."""
+    first = keys.split(",")[0].strip()
+    *mods, k = first.split("+") if first not in ("+", "plus") else ["plus"]
+    return "+".join(mods + [KEY_DISPLAY.get(k, k)])
+
+
+def load_keymap() -> dict[str, str]:
+    try:
+        km = json.loads(KEYMAP_FILE.read_text())
+        return {str(k): str(v) for k, v in km.items()} if isinstance(km, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _with_ids(cls) -> None:
+    """Pone id "Clase.acción" a los Binding propios de la clase que no tienen."""
+    own = cls.__dict__.get("BINDINGS")
+    if own:
+        cls.BINDINGS = [replace(b, id=f"{cls.__name__}.{b.action}") if isinstance(b, Binding) and not b.id else b
+                        for b in own]
+
+
+def bindings_of(cls) -> list[Binding]:
+    """Bindings propios (con id) de una DView / DApp, para listarlos o reasignarlos."""
+    return [b for b in cls.__dict__.get("BINDINGS", []) if isinstance(b, Binding) and b.id]
+
+
+# ── Vistas ────────────────────────────────────────────────
+
+class DView(Vertical):
+    """Contenido de una TUI (lo monta ViewApp). Las subclases definen:
+      FOCUS   selector del widget que recibe el foco al entrar
+      hints() atajos del pie según el panel con foco
+    y usan `self.visible_now` para pausar timers cuando no se ven."""
+
+    FOCUS = "Table"
+
+    def __init_subclass__(cls, **kw) -> None:
+        _with_ids(cls)               # antes de que Textual combine los BINDINGS
+        super().__init_subclass__(**kw)
+
+    def hints(self) -> list[tuple[str, str]]:
+        return []
+
+    def update_hints(self) -> None:
+        # Solo publica sus atajos si el foco está adentro de la vista
+        f = self.app.focused
+        if f is not None and self in f.ancestors_with_self:
+            self.app.set_hints(self.hints())
+
+    def on_descendant_focus(self, _event) -> None:
+        self.update_hints()
+
+    def focus_first(self) -> None:
+        try:
+            self.query(self.FOCUS).first().focus()
+        except Exception:  # noqa: BLE001 - vista sin widgets enfocables todavía
+            pass
+
+    @property
+    def visible_now(self) -> bool:
+        node: Widget | None = self
+        while node is not None and isinstance(node, Widget):
+            if not node.display:
+                return False
+            node = node.parent if isinstance(node.parent, Widget) else None
+        return True
+
+
+# ── Popups ────────────────────────────────────────────────
+
+@dataclass
+class Field:
+    key: str
+    label: str
+    value: str = ""
+    placeholder: str = ""
+    paths: bool = False          # autocompletar carpetas
+    files: bool = False          # autocompletar también archivos
+    password: bool = False       # ocultar lo que se escribe
+    choices: list[tuple[str, str]] | None = None   # [(etiqueta, valor)] → selector
+
+
+class FormModal(ModalScreen[Optional[dict]]):
+    """Formulario en popup. `validate(valores) -> mensaje de error | None`."""
+
+    BINDINGS = [Binding("escape", "cancel", "cancel"),
+                Binding("tab", "app.focus_next", show=False),
+                Binding("shift+tab", "app.focus_previous", show=False),
+                Binding("ctrl+s", "submit", show=False)]
+
+    def __init__(self, title: str, fields: list[Field], hint: str = "",
+                 validate: Callable[[dict], Optional[str]] | None = None,
+                 enter_advances: bool = False, focus: str = "") -> None:
+        """enter_advances: enter pasa al campo siguiente y guarda en el último
+        (para usuario → contraseña). focus: clave del campo con foco inicial."""
+        super().__init__()
+        self.form_title, self.fields, self.hint, self.validate = title, fields, hint, validate
+        self.enter_advances, self.initial_focus = enter_advances, focus
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="modal") as box:
+            box.border_title = f" {self.form_title} "
+            if self.enter_advances:
+                box.border_subtitle = " enter next · esc cancel "
+            elif any(f.choices is not None for f in self.fields):
+                # En un selector enter abre la lista: se guarda con ctrl+s
+                box.border_subtitle = " ctrl+s save · tab next · esc cancel "
+            else:
+                box.border_subtitle = " enter save · tab next · esc cancel "
+            for i, f in enumerate(self.fields):
+                yield Label(f.label, classes="field-label" + (" first" if i == 0 else ""))
+                if f.choices is not None:
+                    yield Select(f.choices, value=f.value if any(v == f.value for _, v in f.choices)
+                                 else f.choices[0][1], allow_blank=False, id=f"f-{f.key}")
+                else:
+                    yield Input(f.value, placeholder=f.placeholder, id=f"f-{f.key}", password=f.password,
+                                suggester=PathSuggester(files=f.files) if (f.paths or f.files) else None)
+            if self.hint:
+                yield Label(self.hint, classes="hint")
+            yield Label("", id="form-error", classes="error")
+
+    def values(self) -> dict:
+        out = {}
+        for f in self.fields:
+            w = self.query_one(f"#f-{f.key}")
+            out[f.key] = str(w.value) if isinstance(w, Select) else w.value.strip()
+        return out
+
+    def action_submit(self) -> None:
+        """ctrl+s guarda desde cualquier campo (también desde un selector)."""
+        vals = self.values()
+        err = self.validate(vals) if self.validate else None
+        if err:
+            self.query_one("#form-error", Label).update(f"✗ {err}")
+            return
+        self.dismiss(vals)
+
+    def on_mount(self) -> None:
+        if self.initial_focus:
+            self.query_one(f"#f-{self.initial_focus}", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        if self.enter_advances and event.input.id != f"f-{self.fields[-1].key}":
+            self.focus_next()
+            return
+        self.action_submit()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class ConfirmModal(ModalScreen[bool]):
+    BINDINGS = [Binding("escape,n", "no", "no"), Binding("y,enter", "yes", "yes")]
+
+    def __init__(self, title: str, message: str) -> None:
+        super().__init__()
+        self.c_title, self.message = title, message
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="modal") as box:
+            box.border_title = f" {self.c_title} "
+            yield Label(self.message, classes="message")
+            yield KeyHints([("y", "yes"), ("n", "no")])
+
+    def action_yes(self) -> None:
+        self.dismiss(True)
+
+    def action_no(self) -> None:
+        self.dismiss(False)
+
+
+class PickModal(ModalScreen[Optional[str]]):
+    """Elegir una fila de una tabla en popup. rows: [(clave, [celdas...])]."""
+
+    BINDINGS = [Binding("escape", "cancel", "cancel")]
+
+    def __init__(self, title: str, columns: list[str], rows: list[tuple[str, list]],
+                 hint: str = "enter select · esc cancel") -> None:
+        super().__init__()
+        self.p_title, self.columns, self.rows, self.hint = title, columns, rows, hint
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="modal") as box:
+            box.border_title = f" {self.p_title} "
+            box.border_subtitle = f" {self.hint} "
+            yield Table(id="pick")
+
+    def on_mount(self) -> None:
+        t = self.query_one("#pick", DataTable)
+        t.add_columns(*self.columns)
+        for key, cells in self.rows:
+            t.add_row(*cells, key=key)
+        t.focus()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        event.stop()   # que no le llegue también a la vista de atrás
+        self.dismiss(event.row_key.value)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class TextModal(ModalScreen[None]):
+    """Texto largo de solo lectura (logs). end=True arranca abajo de todo."""
+
+    BINDINGS = [Binding("escape,q", "close", "close")]
+
+    def __init__(self, title: str, text: str | Text, end: bool = True) -> None:
+        super().__init__()
+        self.t_title, self.text, self.end = title, text, end
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="modal") as box:
+            box.border_title = f" {self.t_title} "
+            box.border_subtitle = " ↑↓ scroll · esc close "
+            with VerticalScroll():
+                yield Static(self.text)
+
+    def on_mount(self) -> None:
+        scroll = self.query_one(VerticalScroll)
+        scroll.focus()
+        if self.end:
+            self.call_after_refresh(scroll.scroll_end, animate=False)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
+# ── Apps ──────────────────────────────────────────────────
+
+class DApp(App):
+    """App base: aplica BASE_CSS + el CSS propio de cada TUI. `q` sale y
+    `esc` llama a action_leave (salir)."""
+
+    CSS = BASE_CSS
+    ENABLE_COMMAND_PALETTE = False
+    BINDINGS = [Binding("q", "quit", "quit", show=False, id="DApp.quit"),
+                Binding("escape", "leave", "back", show=False, id="DApp.leave")]
+
+    def __init_subclass__(cls, **kw) -> None:
+        _with_ids(cls)
+        super().__init_subclass__(**kw)
+
+    def __init__(self, *args, **kw) -> None:
+        super().__init__(*args, **kw)
+        # Teclas reasignadas (keymap.json) antes del primer render
+        self._keymap = self._normalize_keymap(load_keymap())
+
+    def remap_hints(self, hints: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        """Traduce las teclas por defecto de los atajos del pie a las del keymap,
+        mirando los bindings de la vista con foco y los de la app."""
+        if not self._keymap:
+            return hints
+        classes = [type(self)] + list(type(self).__mro__[1:])
+        f = self.focused
+        view = next((n for n in (f.ancestors_with_self if f else []) if isinstance(n, DView)), None)
+        if view is not None:
+            classes = list(type(view).__mro__) + classes
+        remap: dict[str, str] = {}
+        for c in classes:
+            for b in c.__dict__.get("BINDINGS", []):
+                if isinstance(b, Binding) and b.id in self._keymap:
+                    for k in b.key.split(","):
+                        remap.setdefault(key_display(k), key_display(self._keymap[b.id]))
+        out = []
+        for key, label in hints:
+            if key in remap:
+                key = remap[key]
+            elif "/" in key and len(key) > 1:
+                key = "/".join(remap.get(part, part) for part in key.split("/"))
+            out.append((key, label))
+        return out
+
+    def check_action(self, action: str, parameters) -> Optional[bool]:
+        # Con un popup abierto, las teclas de la pantalla principal (las
+        # BINDINGS de la app) no hacen nada; las de Textual siguen andando.
+        if isinstance(self.screen, ModalScreen) and action in {
+                b.action for b in self.BINDINGS if isinstance(b, Binding)}:
+            return False
+        return True
+
+    def set_hints(self, hints: list[tuple[str, str]]) -> None:
+        """Atajos del pie de la pantalla principal (no de un popup)."""
+        try:
+            self.screen_stack[0].query_one("#hints", KeyHints).set_hints(self.remap_hints(hints))
+        except Exception:  # noqa: BLE001 - todavía sin montar
+            pass
+
+    def action_leave(self) -> None:
+        self.exit()
+
+    def notify_ok(self, msg: str) -> None:
+        self.notify(msg, timeout=3)
+
+    def notify_err(self, msg: str) -> None:
+        self.notify(msg, severity="error", timeout=5)
+
+
+class ViewApp(DApp):
+    """Una DView sola como app: `ViewApp(LazyDbView).run()`."""
+
+    def __init__(self, view_cls: type[DView], title: str = "", **view_kw) -> None:
+        super().__init__()
+        self.view = view_cls(**view_kw)
+        self.title = title
+
+    def compose(self) -> ComposeResult:
+        yield self.view
+        yield KeyHints(id="hints")
+
+    def on_mount(self) -> None:
+        self.view.focus_first()
+        self.call_after_refresh(self.view.update_hints)
