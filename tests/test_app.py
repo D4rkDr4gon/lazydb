@@ -142,6 +142,30 @@ class AppTest(unittest.IsolatedAsyncioTestCase):
 
             self.assertIn("UPDATE customers", v.state["history"][PROFILE][1])
 
+    async def test_copy_all_results(self):
+        from unittest import mock
+        app = LazyDbApp(PROFILE)
+        async with app.run_test(size=(180, 50)) as pilot:
+            await settle(app, pilot)
+            v = app.view
+            await open_table(app, pilot, "products")
+            with mock.patch("lazydb.app.copy_text", return_value=True) as cp:
+                await pilot.press("ctrl+y")
+                await pilot.pause()
+            lines = cp.call_args[0][0].splitlines()
+            self.assertEqual([c.strip() for c in lines[0].split("|")[:-1]], v.result.columns)
+            self.assertTrue(set(lines[1]) <= {"-", "+"})
+            self.assertEqual(len(lines), len(v.result.rows) + 2)
+            self.assertEqual(len({len(x) for x in lines}), 1)     # todas alineadas
+
+    def test_text_table(self):
+        from lazydb.app import text_table
+        self.assertEqual(text_table(["tabla", "columna"], [["Delegation", "UID_PersonWantsOrg"], ["PWO", "a\nb"]]),
+                         "tabla     |columna           |\n"
+                         "----------+------------------+\n"
+                         "Delegation|UID_PersonWantsOrg|\n"
+                         "PWO       |a b               |\n")
+
     async def test_readonly_profile(self):
         ro = core.Profile("ro", "sqlite", database=DB, mode="readonly")
         app = LazyDbApp(adhoc=ro)

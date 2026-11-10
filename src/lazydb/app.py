@@ -33,6 +33,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional
 
+from rich.cells import cell_len
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
@@ -70,6 +71,19 @@ def copy_text(text: str) -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return True
+
+
+def text_table(columns: list[str], rows: list[list[str]]) -> str:
+    """Tabla en texto plano con columnas alineadas, estilo `col |col |` con una línea `---+---+`
+    debajo del encabezado. Los saltos de línea de un valor se aplanan para no romper la alineación."""
+    rows = [[v.replace("\r", "").replace("\n", " ").replace("\t", " ") for v in r] for r in rows]
+    widths = [max([cell_len(c)] + [cell_len(r[j]) for r in rows]) for j, c in enumerate(columns)]
+
+    def line(values: list[str]) -> str:
+        return "".join(v + " " * (w - cell_len(v)) + "|" for v, w in zip(values, widths))
+
+    out = [line(columns), "".join("-" * w + "+" for w in widths)] + [line(r) for r in rows]
+    return "\n".join(out) + "\n"
 
 
 def cell(v: Any, style: str = "") -> Text:
@@ -166,6 +180,7 @@ class LazyDbView(DView):
         Binding("r", "refresh", "refresh"),
         Binding("y", "copy", "copy"),
         Binding("Y", "copy_row", "copy row", show=False),
+        Binding("ctrl+y", "copy_all", "copy all results", show=False),
         Binding("L", "log", "session log", show=False),
         Binding("question_mark", "help", "help", show=False),
         Binding("x", "disconnect", "disconnect"),
@@ -1330,6 +1345,21 @@ class LazyDbView(DView):
         res = self.result
         text = "\t".join(C.cell_text(self.value_at(kind, i, j)) for j in range(len(res.columns)))
         self.app.notify_ok("Row copied") if copy_text(text) else self.app.notify_err("Could not copy (wl-copy?)")
+
+    def action_copy_all(self) -> None:
+        """Copia la grilla entera (filas cargadas, con los cambios pendientes) como tabla de texto alineada."""
+        res = self.result
+        if not res or not res.columns:
+            return
+        n = len(res.columns)
+        rows = [[C.cell_text(self.value_at("r", i, j)) for j in range(n)]
+                for i in range(len(res.rows)) if i not in self.deleted]
+        rows += [[C.cell_text(self.value_at("n", i, j)) for j in range(n)] for i in range(len(self.inserted))]
+        more = " (only the loaded ones, G loads more)" if res.more else ""
+        if copy_text(text_table(res.columns, rows)):
+            self.app.notify_ok(f"{len(rows):,} rows copied{more}")
+        else:
+            self.app.notify_err("Could not copy (wl-copy?)")
 
     def action_help(self) -> None:
         t = Text()

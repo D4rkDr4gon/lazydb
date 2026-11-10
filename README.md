@@ -125,6 +125,7 @@ lazydb --demo       # base de ejemplo
 | `G` | | | traer más filas |
 | `X` | | | exportar (Excel o CSV) |
 | `y` / `Y` | | copiar nombre | copiar celda / fila |
+| `ctrl+y` | | | copiar toda la grilla como tabla de texto alineada |
 | `r` | releer perfiles | refrescar | volver a correr |
 | `x` | desconectar | desconectar | desconectar |
 
